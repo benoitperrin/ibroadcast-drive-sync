@@ -32,11 +32,12 @@ log = logging.getLogger(__name__)
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 
-DRIVE_FOLDER  = "1l449OcVapj8voJ8p4i87Gv4bLYfn402a"
+DRIVE_FOLDER  = "1l449OcVapj8voJ8p4i87Gv4bLYfn402a"  # folder ID to override
 DRIVE_TOKEN   = Path.home() / ".config/google/drive_token.json"
-IB_EMAIL      = "benoit.perrin_339@m4x.org"
-IB_PASSWORD   = "TJaKjmpHM!7tr6A"
-IB_ALBUM_ID   = "206662993"
+IB_ALBUM_ID   = "206662993"  # album ID to override
+
+# Credentials: read from ib-drive-sync config or set via env IB_EMAIL / IB_PASSWORD
+_IB_CONFIG    = Path.home() / ".config/ib-drive-sync/config.json"
 IMG_CACHE     = Path("/tmp/psaumes-enluminures")
 IMG_BASE_URL  = "https://staticpsaume.retraitedanslaville.org/var/images/enluminures/"
 IMG_SIZE      = 500   # px (upscale depuis 180x173)
@@ -260,8 +261,15 @@ def get_drive():
 
 
 def ib_login():
+    import os
+    if _IB_CONFIG.exists():
+        cfg = json.loads(_IB_CONFIG.read_text())
+        email, password = cfg["ib_email"], cfg["ib_password"]
+    else:
+        email    = os.environ["IB_EMAIL"]
+        password = os.environ["IB_PASSWORD"]
     s = requests.Session()
-    s.post(IB_LOGIN, data={"email": IB_EMAIL, "password": IB_PASSWORD},
+    s.post(IB_LOGIN, data={"email": email, "password": password},
            headers={"User-Agent": CLIENT}, allow_redirects=True)
     user_id = s.cookies.get("user_id")
     token   = s.cookies.get("token")
