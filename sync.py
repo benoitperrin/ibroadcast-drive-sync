@@ -31,6 +31,8 @@ from googleapiclient.http import MediaIoBaseDownload
 
 CONFIG_DIR  = Path.home() / ".config" / "ib-drive-sync"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+# Battement lu par une sentinelle externe : "<epoch> <seuil en minutes> <libellé>", écrit seulement si le dossier existe
+BATTEMENT   = Path.home() / ".config" / "battements" / "ib-drive-sync"
 STATE_DB    = CONFIG_DIR / "state.db"
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".wav", ".aac", ".opus", ".wma"}
@@ -63,8 +65,11 @@ def ib_login(email: str, password: str) -> tuple[str, str]:
 
 
 def ib_get_md5s(user_id: str, token: str) -> set[str]:
-    """Retourne l'ensemble des MD5 déjà présents sur iBroadcast."""
-    resp = requests.post(IB_SYNC,
+    """Retourne l'ensemble des MD5 déjà présents sur iBroadcast.
+    Depuis octobre 2026, la liste vient de upload.ibroadcast.com : sync.ibroadcast.com
+    répond 400 et réclame les champs d'un envoi (client, method, version, file_path).
+    """
+    resp = requests.post(IB_UPLOAD,
         data=f"user_id={user_id}&token={token}",
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "User-Agent": CLIENT},
@@ -127,7 +132,9 @@ def get_drive_service(token_file: Path):
 
 
 def list_drive_audio(service, folder_id: str) -> list[dict]:
-    """Liste récursivement tous les fichiers audio dans un dossier Drive."""
+    """Liste récursivement tous les fichiers audio dans un dossier Drive.
+    Suit les raccourcis Drive (application/vnd.google-apps.shortcut).
+    """
     results = []
 
     def _recurse(fid: str):
@@ -135,13 +142,26 @@ def list_drive_audio(service, folder_id: str) -> list[dict]:
         while True:
             resp = service.files().list(
                 q=f"'{fid}' in parents and trashed=false",
-                fields="nextPageToken,files(id,name,md5Checksum,mimeType,size,modifiedTime)",
+                fields="nextPageToken,files(id,name,md5Checksum,mimeType,size,modifiedTime,shortcutDetails)",
                 pageToken=page_token,
                 pageSize=1000,
             ).execute()
             for f in resp.get("files", []):
                 if f["mimeType"] == "application/vnd.google-apps.folder":
                     _recurse(f["id"])
+                elif f["mimeType"] == "application/vnd.google-apps.shortcut":
+                    # Raccourci : résoudre vers le vrai fichier
+                    target_id = (f.get("shortcutDetails") or {}).get("targetId")
+                    if target_id and Path(f["name"]).suffix.lower() in AUDIO_EXTS:
+                        try:
+                            real = service.files().get(
+                                fileId=target_id,
+                                fields="id,name,md5Checksum,mimeType,size,modifiedTime",
+                            ).execute()
+                            if Path(real["name"]).suffix.lower() in AUDIO_EXTS:
+                                results.append(real)
+                        except Exception:
+                            log.warning(f"Raccourci inaccessible : {f['name']}")
                 elif Path(f["name"]).suffix.lower() in AUDIO_EXTS:
                     results.append(f)
             page_token = resp.get("nextPageToken")
@@ -203,7 +223,11 @@ def sync(config: dict, dry_run: bool = False):
     log.info(f"{len(ib_md5s)} fichiers déjà sur iBroadcast")
 
     # Fichiers à uploader (pas encore sur iBroadcast selon MD5)
-    to_upload = [f for f in drive_files if f.get("md5Checksum") not in ib_md5s]
+    EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"  # MD5 d'un fichier vide
+    empty_files = [f for f in drive_files if not f.get("md5Checksum") or f.get("md5Checksum") == EMPTY_MD5]
+    if empty_files:
+        log.warning(f"{len(empty_files)} fichiers vides (0 octets) ignorés : " + ", ".join(f["name"] for f in empty_files[:5]) + ("..." if len(empty_files) > 5 else ""))
+    to_upload = [f for f in drive_files if f.get("md5Checksum") not in ib_md5s and f.get("md5Checksum") and f.get("md5Checksum") != EMPTY_MD5]
     log.info(f"À uploader : {len(to_upload)}")
 
     uploaded = errors = 0
@@ -247,6 +271,12 @@ def sync(config: dict, dry_run: bool = False):
 
     log.info(f"Terminé — uploadé: {uploaded}, erreurs: {errors}")
     return uploaded, errors
+
+
+def battement():
+    """Atteste un passage complet. Une exception le saute : la sentinelle voit alors le retard."""
+    if BATTEMENT.parent.is_dir():
+        BATTEMENT.write_text(f"{int(time.time())} 60 Drive vers iBroadcast (ib-drive-sync)\n")
 
 
 # ── Setup wizard ──────────────────────────────────────────────────────────────
@@ -325,6 +355,7 @@ def main():
     while True:
         try:
             sync(config)
+            battement()
         except Exception as e:
             log.error(f"Erreur sync: {e}")
         time.sleep(interval)

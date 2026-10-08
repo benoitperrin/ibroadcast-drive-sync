@@ -54,9 +54,11 @@ systemctl --user enable --now ib-drive-sync
 For deployment to a remote server (e.g. an OCI ARM instance):
 
 ```bash
-./deploy-condor.sh
-ssh condor 'systemctl --user enable --now ib-drive-sync'
+./deploy.sh <ssh-host>
+ssh <ssh-host> 'systemctl --user enable --now ib-drive-sync'
 ```
+
+After each complete pass, the daemon writes a heartbeat line (`<epoch> <threshold in minutes> <label>`) to `~/.config/battements/ib-drive-sync`, when that directory exists, for an external watchdog.
 
 ---
 
