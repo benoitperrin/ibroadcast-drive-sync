@@ -32,6 +32,26 @@ Config file: `~/.config/ib-drive-sync/config.json`
 
 Run `sync.py --setup` to create this file interactively.
 
+#### Transcoding (optional)
+
+iBroadcast's free tier caps storage at 5 GB. Spoken word survives a low bitrate well, so `sync.py` can re-encode files to Opus before uploading them, leaving the Drive originals untouched:
+
+```json
+"transcode": {
+  "bitrate": "32k",
+  "channels": 1,
+  "keep_original": ["Bach", "Gregorian"],
+  "workers": 3
+}
+```
+
+- `keep_original`: top-level Drive folders uploaded as-is, typically music.
+- `workers`: parallel download and transcode jobs. Uploads stay sequential.
+- Tags are kept, and the embedded cover is carried over with mutagen, since ffmpeg 6 does not write pictures into Ogg.
+- Needs `ffmpeg` built with `libopus`.
+
+Since a transcoded file no longer has the Drive MD5, `state.db` decides for every file it knows, rejected uploads included, and the iBroadcast MD5 list only for unknown files. That list also keeps deleted files for hours. A file modified on Drive has its old track trashed before the new upload, otherwise iBroadcast rejects it as a tag duplicate.
+
 #### Google Drive credentials
 
 The Drive token (`drive_token_file`) is an OAuth2 token in the format produced by tools like [rclone](https://rclone.org/) or the Google API Python client. It must have `drive.readonly` scope at minimum.
@@ -58,7 +78,7 @@ For deployment to a remote server (e.g. an OCI ARM instance):
 ssh <ssh-host> 'systemctl --user enable --now ib-drive-sync'
 ```
 
-After each complete pass, the daemon writes a heartbeat line (`<epoch> <threshold in minutes> <label>`) to `~/.config/battements/ib-drive-sync`, when that directory exists, for an external watchdog.
+After each complete pass, and after each upload during a long one, the daemon writes a heartbeat line (`<epoch> <threshold in minutes> <label>`) to `~/.config/battements/ib-drive-sync`, when that directory exists, for an external watchdog.
 
 ---
 

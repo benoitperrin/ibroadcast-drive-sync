@@ -10,18 +10,25 @@ Usage:
   sync.py --setup      # assistant de configuration initiale
 """
 
+import base64
 import io
 import json
 import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import mutagen
 import requests
+from mutagen.flac import Picture
+from mutagen.oggopus import OggOpus
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -134,10 +141,11 @@ def get_drive_service(token_file: Path):
 def list_drive_audio(service, folder_id: str) -> list[dict]:
     """Liste récursivement tous les fichiers audio dans un dossier Drive.
     Suit les raccourcis Drive (application/vnd.google-apps.shortcut).
+    Chaque fichier porte "path", son chemin relatif au dossier racine.
     """
     results = []
 
-    def _recurse(fid: str):
+    def _recurse(fid: str, prefix: str = ""):
         page_token = None
         while True:
             resp = service.files().list(
@@ -147,8 +155,9 @@ def list_drive_audio(service, folder_id: str) -> list[dict]:
                 pageSize=1000,
             ).execute()
             for f in resp.get("files", []):
+                f["path"] = prefix + f["name"]
                 if f["mimeType"] == "application/vnd.google-apps.folder":
-                    _recurse(f["id"])
+                    _recurse(f["id"], f["path"] + "/")
                 elif f["mimeType"] == "application/vnd.google-apps.shortcut":
                     # Raccourci : résoudre vers le vrai fichier
                     target_id = (f.get("shortcutDetails") or {}).get("targetId")
@@ -159,6 +168,7 @@ def list_drive_audio(service, folder_id: str) -> list[dict]:
                                 fields="id,name,md5Checksum,mimeType,size,modifiedTime",
                             ).execute()
                             if Path(real["name"]).suffix.lower() in AUDIO_EXTS:
+                                real["path"] = f["path"]
                                 results.append(real)
                         except Exception:
                             log.warning(f"Raccourci inaccessible : {f['name']}")
@@ -179,6 +189,52 @@ def download_drive_file(service, file_id: str, dest: Path):
         done = False
         while not done:
             _, done = dl.next_chunk()
+
+
+# ── Transcodage ───────────────────────────────────────────────────────────────
+
+def keeps_original(path: str, tc: dict) -> bool:
+    """Vrai si le fichier part tel quel : son dossier de tête est dans keep_original."""
+    return path.split("/", 1)[0] in tc.get("keep_original", [])
+
+
+def embedded_cover(src: Path) -> tuple[bytes, str] | None:
+    """Pochette intégrée au fichier source (ID3, MP4 ou FLAC), ou None."""
+    try:
+        mf = mutagen.File(src)
+    except Exception:
+        return None
+    if mf is None:
+        return None
+    if getattr(mf, "pictures", None):
+        return mf.pictures[0].data, mf.pictures[0].mime
+    tags = mf.tags
+    if tags is None:
+        return None
+    for key in tags.keys():
+        if key.startswith("APIC"):
+            return tags[key].data, tags[key].mime
+    if "covr" in tags and tags["covr"]:
+        cover = tags["covr"][0]
+        return bytes(cover), "image/png" if cover.imageformat == cover.FORMAT_PNG else "image/jpeg"
+    return None
+
+
+def transcode_opus(src: Path, dest: Path, tc: dict):
+    """Réencode en Opus, garde les tags, reporte la pochette : ffmpeg 6 ne l'écrit pas dans l'Ogg."""
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-map_metadata", "0",
+         "-ac", str(tc.get("channels", 1)), "-c:a", "libopus", "-b:a", tc.get("bitrate", "32k"), str(dest)],
+        check=True, capture_output=True,
+    )
+    cover = embedded_cover(src)
+    if cover:
+        pic = Picture()
+        pic.type, pic.desc = 3, ""
+        pic.data, pic.mime = cover
+        opus = OggOpus(dest)
+        opus["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+        opus.save()
 
 
 # ── State DB ──────────────────────────────────────────────────────────────────
@@ -227,28 +283,76 @@ def sync(config: dict, dry_run: bool = False):
     empty_files = [f for f in drive_files if not f.get("md5Checksum") or f.get("md5Checksum") == EMPTY_MD5]
     if empty_files:
         log.warning(f"{len(empty_files)} fichiers vides (0 octets) ignorés : " + ", ".join(f["name"] for f in empty_files[:5]) + ("..." if len(empty_files) > 5 else ""))
-    to_upload = [f for f in drive_files if f.get("md5Checksum") not in ib_md5s and f.get("md5Checksum") and f.get("md5Checksum") != EMPTY_MD5]
+    # state.db fait foi pour les fichiers qu'il connaît, refusés compris (track_id vide) : un fichier
+    # réencodé n'a plus le MD5 du Drive, et la liste d'iBroadcast garde des heures les MD5 supprimés.
+    # La liste ne tranche que pour les fichiers inconnus de state.db.
+    known = {fid: (md5, tid) for fid, md5, tid in db.execute("SELECT drive_file_id, drive_md5, ib_track_id FROM synced")}
+
+    def needs_upload(f: dict) -> bool:
+        md5 = f.get("md5Checksum")
+        if not md5 or md5 == EMPTY_MD5:
+            return False
+        if f["id"] in known:
+            return known[f["id"]][0] != md5
+        return md5 not in ib_md5s
+
+    to_upload = [f for f in drive_files if needs_upload(f)]
     log.info(f"À uploader : {len(to_upload)}")
 
-    uploaded = errors = 0
-    with tempfile.TemporaryDirectory() as tmpdir:
+    tc = config.get("transcode")
+    if dry_run:
         for i, f in enumerate(to_upload, 1):
+            log.info(f"[{i}/{len(to_upload)}] {f.get('path', f['name'])} (dry-run, skip)")
+        to_upload = []
+
+    # Téléchargement et réencodage en parallèle, un service Drive par thread : l'objet n'est pas thread-safe
+    local = threading.local()
+    token_lock = threading.Lock()
+
+    def prepare(f: dict, tmpdir: str) -> Path:
+        if not hasattr(local, "drive"):
+            with token_lock:
+                local.drive = get_drive_service(Path(config["drive_token_file"]))
+        dest = Path(tmpdir) / f["id"] / f["name"]
+        dest.parent.mkdir()
+        download_drive_file(local.drive, f["id"], dest)
+        if tc and not keeps_original(f.get("path", f["name"]), tc):
+            opus = dest.with_suffix(".opus")
+            transcode_opus(dest, opus, tc)
+            dest.unlink()
+            dest = opus
+        return dest
+
+    uploaded = errors = rejected = 0
+    workers = (tc or {}).get("workers", 1)
+    with tempfile.TemporaryDirectory() as tmpdir, ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(prepare, f, tmpdir): f for f in to_upload}
+        for i, fut in enumerate(as_completed(futures), 1):
+            f = futures[fut]
             name = f["name"]
-            log.info(f"[{i}/{len(to_upload)}] {name}")
-            if dry_run:
-                log.info("  (dry-run, skip)")
-                continue
-            dest = Path(tmpdir) / name
+            log.info(f"[{i}/{len(to_upload)}] {f.get('path', name)}")
             try:
-                download_drive_file(drive, f["id"], dest)
+                dest = fut.result()
+                # Fichier modifié sur le Drive : l'ancienne piste part d'abord, sinon iBroadcast
+                # refuse la nouvelle comme doublon de tags
+                old_tid = known.get(f["id"], (None, None))[1]
+                if old_tid:
+                    ib_trash(user_id, token, [old_tid])
+                    log.info(f"  ancienne piste {old_tid} à la corbeille")
                 track_id = ib_upload(user_id, token, dest, label=name)
                 db.execute(
                     "INSERT OR REPLACE INTO synced VALUES (?,?,?,?,?)",
                     (f["id"], f.get("md5Checksum"), name, track_id, int(time.time()))
                 )
                 db.commit()
-                uploaded += 1
-                log.info(f"  → track_id={track_id}")
+                dest.unlink()
+                if track_id:
+                    uploaded += 1
+                    log.info(f"  → track_id={track_id}")
+                else:
+                    rejected += 1
+                    log.warning("  → refusé par iBroadcast (doublon ?), noté pour ne pas le renvoyer")
+                battement()
             except Exception as e:
                 errors += 1
                 log.error(f"  → ERREUR: {e}")
@@ -269,12 +373,13 @@ def sync(config: dict, dry_run: bool = False):
                     db.execute("DELETE FROM synced WHERE drive_file_id=?", (fid,))
                 db.commit()
 
-    log.info(f"Terminé — uploadé: {uploaded}, erreurs: {errors}")
+    log.info(f"Terminé — uploadé: {uploaded}, refusés: {rejected}, erreurs: {errors}")
     return uploaded, errors
 
 
 def battement():
-    """Atteste un passage complet. Une exception le saute : la sentinelle voit alors le retard."""
+    """Atteste un passage complet, ou un envoi réussi pendant un long passage.
+    Une exception le saute : la sentinelle voit alors le retard."""
     if BATTEMENT.parent.is_dir():
         BATTEMENT.write_text(f"{int(time.time())} 60 Drive vers iBroadcast (ib-drive-sync)\n")
 
@@ -347,6 +452,8 @@ def main():
 
     if "--once" in sys.argv or dry_run:
         sync(config, dry_run=dry_run)
+        if not dry_run:
+            battement()
         return
 
     # Daemon
