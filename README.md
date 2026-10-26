@@ -41,7 +41,8 @@ iBroadcast's free tier caps storage at 5 GB. Spoken word survives a low bitrate 
   "bitrate": "32k",
   "channels": 1,
   "keep_original": ["Bach", "Gregorian"],
-  "workers": 3
+  "workers": 3,
+  "cache_dir": "~/.cache/ib-drive-sync/opus"
 }
 ```
 
@@ -49,6 +50,7 @@ iBroadcast's free tier caps storage at 5 GB. Spoken word survives a low bitrate 
 - `workers`: parallel download and transcode jobs. Uploads stay sequential.
 - Tags are kept, and the embedded cover is carried over with mutagen, since ffmpeg 6 does not write pictures into Ogg.
 - Needs `ffmpeg` built with `libopus`.
+- `cache_dir` (optional): keeps every Opus file it encodes, keyed by a hash of the audio stream and the settings. When only the tags or the cover change on Drive, the cached audio gets the new tags in a second instead of a full re-encode. `sync.py --warm-cache` fills it for the whole folder without uploading anything.
 
 Since a transcoded file no longer has the Drive MD5, `state.db` decides for every file it knows, rejected uploads included, and the iBroadcast MD5 list only for unknown files. That list also keeps deleted files for hours. A file modified on Drive has its old track trashed before the new upload, otherwise iBroadcast rejects it as a tag duplicate.
 

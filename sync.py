@@ -7,15 +7,18 @@ Usage:
   sync.py              # daemon (boucle infinie)
   sync.py --once       # une passe et quitte
   sync.py --dry-run    # simule sans uploader ni trasher
+  sync.py --warm-cache # remplit le cache des Opus, sans rien envoyer
   sync.py --setup      # assistant de configuration initiale
 """
 
 import base64
+import hashlib
 import io
 import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -43,6 +46,7 @@ BATTEMENT   = Path.home() / ".config" / "battements" / "ib-drive-sync"
 STATE_DB    = CONFIG_DIR / "state.db"
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".ogg", ".wav", ".aac", ".opus", ".wma"}
+EMPTY_MD5  = "d41d8cd98f00b204e9800998ecf8427e"  # MD5 d'un fichier vide
 
 IB_LOGIN  = "https://login.ibroadcast.com/"
 IB_API    = "https://api.ibroadcast.com/"
@@ -220,13 +224,37 @@ def embedded_cover(src: Path) -> tuple[bytes, str] | None:
     return None
 
 
+def audio_key(src: Path, tc: dict) -> str:
+    """Empreinte du son seul et des réglages : une retouche de tags ou de pochette ne la change pas."""
+    md5 = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(src), "-map", "0:a:0", "-c", "copy", "-f", "md5", "-"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return hashlib.md5(f"{md5}|{tc.get('bitrate', '32k')}|{tc.get('channels', 1)}".encode()).hexdigest()
+
+
 def transcode_opus(src: Path, dest: Path, tc: dict):
-    """Réencode en Opus, garde les tags, reporte la pochette : ffmpeg 6 ne l'écrit pas dans l'Ogg."""
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-map_metadata", "0",
-         "-ac", str(tc.get("channels", 1)), "-c:a", "libopus", "-b:a", tc.get("bitrate", "32k"), str(dest)],
-        check=True, capture_output=True,
-    )
+    """Réencode en Opus, garde les tags, reporte la pochette : ffmpeg 6 ne l'écrit pas dans l'Ogg.
+    Avec cache_dir, un son déjà encodé n'est pas réencodé : l'audio gardé reçoit les tags du jour."""
+    cache = Path(tc["cache_dir"]).expanduser() if tc.get("cache_dir") else None
+    cached = cache / f"{audio_key(src, tc)}.opus" if cache else None
+    if cached and cached.exists():
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(cached), "-i", str(src), "-map", "0:a",
+             "-map_metadata", "1", "-map_metadata:s:a", "-1", "-c", "copy", str(dest)],
+            check=True, capture_output=True,
+        )
+    else:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-map_metadata", "0",
+             "-ac", str(tc.get("channels", 1)), "-c:a", "libopus", "-b:a", tc.get("bitrate", "32k"), str(dest)],
+            check=True, capture_output=True,
+        )
+        if cached:
+            cache.mkdir(parents=True, exist_ok=True)
+            tmp = cached.with_suffix(f".{threading.get_ident()}.tmp")
+            shutil.copyfile(dest, tmp)
+            tmp.replace(cached)
     cover = embedded_cover(src)
     if cover:
         pic = Picture()
@@ -279,7 +307,6 @@ def sync(config: dict, dry_run: bool = False):
     log.info(f"{len(ib_md5s)} fichiers déjà sur iBroadcast")
 
     # Fichiers à uploader (pas encore sur iBroadcast selon MD5)
-    EMPTY_MD5 = "d41d8cd98f00b204e9800998ecf8427e"  # MD5 d'un fichier vide
     empty_files = [f for f in drive_files if not f.get("md5Checksum") or f.get("md5Checksum") == EMPTY_MD5]
     if empty_files:
         log.warning(f"{len(empty_files)} fichiers vides (0 octets) ignorés : " + ", ".join(f["name"] for f in empty_files[:5]) + ("..." if len(empty_files) > 5 else ""))
@@ -377,6 +404,44 @@ def sync(config: dict, dry_run: bool = False):
     return uploaded, errors
 
 
+def warm_cache(config: dict):
+    """Encode une fois chaque fichier destiné à l'Opus, sans rien envoyer : la prochaine retouche de tags
+    ou de pochette ne réencodera pas."""
+    tc = config.get("transcode") or {}
+    if not tc.get("cache_dir"):
+        log.error("transcode.cache_dir absent de la config")
+        return
+    drive = get_drive_service(Path(config["drive_token_file"]))
+    files = [f for f in list_drive_audio(drive, config["drive_folder_id"])
+             if f.get("md5Checksum") not in (None, EMPTY_MD5) and not keeps_original(f.get("path", f["name"]), tc)]
+    log.info(f"Cache des Opus : {len(files)} fichiers à vérifier")
+    local = threading.local()
+    token_lock = threading.Lock()
+
+    def warm(f: dict, tmpdir: str):
+        if not hasattr(local, "drive"):
+            with token_lock:
+                local.drive = get_drive_service(Path(config["drive_token_file"]))
+        src = Path(tmpdir) / f["id"] / f["name"]
+        src.parent.mkdir()
+        download_drive_file(local.drive, f["id"], src)
+        transcode_opus(src, src.with_suffix(".opus"), tc)
+        shutil.rmtree(src.parent)
+
+    errors = 0
+    with tempfile.TemporaryDirectory() as tmpdir, ThreadPoolExecutor(max_workers=tc.get("workers", 1)) as pool:
+        futures = {pool.submit(warm, f, tmpdir): f for f in files}
+        for i, fut in enumerate(as_completed(futures), 1):
+            try:
+                fut.result()
+            except Exception as e:
+                errors += 1
+                log.error(f"  {futures[fut].get('path')} → ERREUR: {e}")
+            if i % 50 == 0:
+                log.info(f"[{i}/{len(files)}]")
+    log.info(f"Cache des Opus terminé — fichiers : {len(files)}, erreurs : {errors}")
+
+
 def battement():
     """Atteste un passage complet, ou un envoi réussi pendant un long passage.
     Une exception le saute : la sentinelle voit alors le retard."""
@@ -447,6 +512,10 @@ def main():
 
     with open(CONFIG_FILE) as f:
         config = json.load(f)
+
+    if "--warm-cache" in sys.argv:
+        warm_cache(config)
+        return
 
     dry_run = "--dry-run" in sys.argv
 
